@@ -4,8 +4,11 @@
 //! being dropped. `POST /approvals/{id}/approve` re-runs the policy engine via
 //! [`PolicyEngine::evaluate_approved`] — approval satisfies the autonomy gate
 //! only, so the kill switch, args schema, protected assets and blast radius
-//! checks still apply — then executes the stored call. `reject` records the
-//! human's refusal. Every decision is audited with the approver as actor.
+//! checks still apply — then executes the stored call. The kill-switch state is
+//! re-read at decision time (see [`decide_approved`]): approvals can arrive
+//! while no `/invoke` traffic is flowing, which is exactly what happens after
+//! the switch is engaged. `reject` records the human's refusal. Every decision
+//! is audited with the approver as actor.
 //!
 //! Pending approvals live in memory: a restart forgets them, which fails
 //! closed (a forgotten approval never executes). Persist to Postgres if you
@@ -248,6 +251,20 @@ pub struct Outcome {
     result: Option<ToolResult>,
 }
 
+/// Re-evaluates an approved call with the **live** kill-switch state.
+///
+/// `/invoke` refreshes the cached `EvalCtx` flag on every call, but approvals
+/// are decided precisely when `/invoke` traffic has stopped (the agents halt as
+/// soon as the switch is engaged). Without this refresh a call parked before
+/// the switch was pulled could still be approved and executed while the gate
+/// denies everything else. Every other verdict input (schema, protected
+/// assets, blast radius) is unchanged: approval only satisfies autonomy.
+async fn decide_approved(s: &Arc<AppState>, call: &ToolCall) -> Decision {
+    let mut ctx = s.eval_ctx.lock().await;
+    ctx.refresh_kill_switch();
+    s.engine.evaluate_approved(call, &mut ctx)
+}
+
 /// `POST /approvals/{id}/approve` — re-check policy, then execute.
 pub async fn approve(
     State(s): State<Arc<AppState>>,
@@ -272,10 +289,7 @@ pub async fn approve(
         })?;
     let call = settled.call.clone();
 
-    let decision = {
-        let mut ctx = s.eval_ctx.lock().await;
-        s.engine.evaluate_approved(&call, &mut ctx)
-    };
+    let decision = decide_approved(&s, &call).await;
 
     let result = match &decision.kind {
         DecisionKind::Allow => crate::claim_and_execute(&s, &call).await,
@@ -548,5 +562,133 @@ mod state_tests {
             store.mark_failed(&id).unwrap_err(),
             SettleError::AlreadyDecided(Status::Rejected)
         );
+    }
+}
+
+/// Approval decisions must observe the **live** kill switch: a call parked
+/// while the switch was off is denied if the operator engages it before the
+/// approval is decided.
+#[cfg(test)]
+mod kill_switch_tests {
+    use super::*;
+    use axum::extract::Extension;
+    use policy_engine::{EvalCtx, PolicyEngine};
+    use serde_json::json;
+    use std::path::Path as FsPath;
+    use tokio::sync::Mutex;
+
+    /// The kill switch is process-global, so tests that engage it must not run
+    /// concurrently with each other.
+    static KILL_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    fn policies_dir() -> std::path::PathBuf {
+        FsPath::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../policies")
+            .canonicalize()
+            .expect("policies dir")
+    }
+
+    fn state() -> Arc<AppState> {
+        let engine = PolicyEngine::load(&policies_dir()).expect("load policies");
+        Arc::new(AppState {
+            engine,
+            registry: crate::executors::build_registry(&connectors::ConnectorConfig::from_env()),
+            audit: None,
+            idem: crate::idempotency::Store::mem(),
+            approvals: Store::new(),
+            eval_ctx: Mutex::new(EvalCtx::new()),
+        })
+    }
+
+    fn parked_exec() -> ToolCall {
+        ToolCall {
+            id: Uuid::new_v4(),
+            tool: "exec.sandbox".to_string(),
+            args: json!({"command": "echo", "args": ["hi"]}),
+            actor: "response-agent".to_string(),
+            idempotency_key: String::new(),
+            correlation_id: Uuid::new_v4(),
+        }
+    }
+
+    fn approver() -> http_limits::auth::Actor {
+        http_limits::auth::Actor {
+            name: "alice".to_string(),
+            role: "approver".to_string(),
+        }
+    }
+
+    /// Clears the kill-switch inputs so each test starts from a known state.
+    fn clear_kill_env() {
+        for var in [
+            "ARES_KILL_SWITCH",
+            "ARES_KILL_FILE",
+            "ARES_CONTROL_DIR",
+            "POLICIES_DIR",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[tokio::test]
+    async fn parked_call_is_denied_while_kill_switch_engaged() {
+        let _guard = KILL_ENV_LOCK.lock().await;
+        clear_kill_env();
+        let s = state();
+        let call = parked_exec();
+        let id = s.approvals.insert(&call, "requires approval");
+
+        // Engage through the same predicate the shipped control plane writes:
+        // a non-empty `kill` file in the policies/control directory.
+        let dir = std::env::temp_dir().join(format!("ares-approval-kill-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kill"), "engaged\n").unwrap();
+        std::env::set_var("POLICIES_DIR", &dir);
+
+        let out = approve(State(s.clone()), Path(id), Extension(approver()), None)
+            .await
+            .expect("approval handler");
+        std::env::remove_var("POLICIES_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let decision = out.decision.as_ref().expect("decision");
+        assert!(
+            matches!(decision.kind, DecisionKind::Deny),
+            "parked call must not execute during a kill switch: {decision:?}"
+        );
+        assert!(
+            decision.reason.contains("kill switch"),
+            "{}",
+            decision.reason
+        );
+        assert_eq!(out.approval.status, Status::ExecutionFailed);
+        assert!(out.result.as_ref().map(|r| !r.ok).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn parked_call_executes_when_kill_switch_is_off() {
+        let _guard = KILL_ENV_LOCK.lock().await;
+        clear_kill_env();
+        let s = state();
+        let call = ToolCall {
+            id: Uuid::new_v4(),
+            tool: "misp.sighting.add".to_string(),
+            args: json!({"value": "203.0.113.9"}),
+            actor: "response-agent".to_string(),
+            idempotency_key: String::new(),
+            correlation_id: Uuid::new_v4(),
+        };
+        let id = s.approvals.insert(&call, "requires approval");
+
+        let out = approve(State(s.clone()), Path(id), Extension(approver()), None)
+            .await
+            .expect("approval handler");
+
+        let decision = out.decision.as_ref().expect("decision");
+        assert!(
+            matches!(decision.kind, DecisionKind::Allow),
+            "approval must still execute when the switch is off: {decision:?}"
+        );
+        assert_eq!(out.approval.status, Status::Approved);
     }
 }

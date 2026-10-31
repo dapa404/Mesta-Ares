@@ -37,6 +37,9 @@ and `agent_checkpoints` (api-server folds it into task/run status).
 - `GET|POST tool-server:8090/approvals…` — calls parked by `autonomy: approval`.
   Statuses: `pending → approved` (approved *and* executed), `execution_failed`
   (approved but the tool failed; `result.error` says why), `rejected`, `expired`.
+  Approve re-runs policy with the **live** kill switch (read at decision time,
+  not the cached value from `/invoke`); a denial — e.g. the switch is engaged —
+  lands in `execution_failed` and the stored call is not executed.
 - `GET api-server:8080/…` — `/health /alerts /alerts/:id /cases /cases/:id /audit /metrics /coverage /plans/:case_id`.
 - `POST /controls/kill-switch` — engages/disengages `$POLICIES_DIR/kill`; `GET` reads state. Fail-closed reads.
 - `GET /stream/activity` — SSE, event `{workflow_run_id, agent, step, detail, ts}`.
